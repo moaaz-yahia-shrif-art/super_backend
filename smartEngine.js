@@ -324,6 +324,8 @@ class UltraBackendEngine {
     const now = Date.now();
     for (let i = 0; i < this.queue.length; i++) {
       const t = this.queue[i];
+      if (!t) continue;
+
       if (t.dependencies && t.dependencies.length > 0) {
         const allDone = t.dependencies.every((dep) =>
           this.completedTasks.has(dep),
@@ -474,15 +476,17 @@ class UltraBackendEngine {
           `Backoff: ${backoffDelay}ms left: ${currentTask.retriesLeft}`,
         );
 
+        const taskToRetry = currentTask;
+        currentTask = null;
+        this.activeTasks.delete(taskToRetry.id);
+
         setTimeout(() => {
           if (!this.isShuttingDown) {
-            this.queue.push(currentTask);
+            this.queue.push(taskToRetry);
             this.sortQueue();
             this.processNext();
           }
         }, backoffDelay);
-
-        currentTask = null;
       } else {
         this.addToAuditLog(currentTask.id, "FAILED", error.message);
         this.emit("onTaskFailed", {
@@ -627,6 +631,7 @@ class UltraBackendEngine {
     this.isPaused = true;
     this.log("warn", "Execution Engine Paused.");
   }
+
   resume() {
     this.isPaused = false;
     this.log("success", "Execution Engine Resumed.");
@@ -674,6 +679,7 @@ class UltraBackendEngine {
   on(event, callback) {
     if (this.listeners[event]) this.listeners[event].push(callback);
   }
+
   emit(event, data) {
     if (this.listeners[event]) this.listeners[event].forEach((cb) => cb(data));
   }
