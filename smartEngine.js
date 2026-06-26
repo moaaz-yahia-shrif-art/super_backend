@@ -1,3 +1,5 @@
+const v8 = require("v8");
+
 class UltraBackendEngine {
   constructor(options = {}) {
     this.queue = [];
@@ -6,7 +8,8 @@ class UltraBackendEngine {
     this.activeCount = 0;
     this.isPaused = false;
     this.consecutiveFailures = 0;
-    this.isCircuitOpen = false;
+    this.circuitState = "CLOSED";
+    this.circuitOpenTime = 0;
     this.isShuttingDown = false;
     this.taskIdCounter = 0;
     this.enableLogging =
@@ -20,6 +23,7 @@ class UltraBackendEngine {
     this.completedTasks = new Set();
     this.activeTasks = new Map();
     this.traces = [];
+
     this.rateLimits = {
       globalPerMinute: options.globalPerMinute || 0,
       perKeyPerMinute: options.perKeyPerMinute || 0,
@@ -36,8 +40,9 @@ class UltraBackendEngine {
     this.defaultTimeout = options.defaultTimeout || 10000;
     this.maxRetries = options.maxRetries || 2;
     this.circuitThreshold = options.circuitBreakerThreshold || 5;
-    this.memoryLimit =
-      options.memoryLimit !== undefined ? options.memoryLimit : 0.96;
+    this.circuitCooldown = options.circuitCooldown || 30000;
+    this.memoryLimit = options.memoryLimit || 0.85;
+    this.deadlineTimeout = options.deadlineTimeout || 60000;
 
     this.metrics = {
       totalProcessed: 0,
@@ -45,7 +50,9 @@ class UltraBackendEngine {
       failed: 0,
       totalWaitTime: 0,
       totalExecTime: 0,
+      circuitBreakerTrips: 0,
     };
+
     this.listeners = {
       onTaskStart: [],
       onTaskSuccess: [],
@@ -53,6 +60,7 @@ class UltraBackendEngine {
       onQueueFull: [],
       onDrain: [],
       onShutdown: [],
+      onMemoryWarning: [],
     };
   }
 
@@ -63,6 +71,7 @@ class UltraBackendEngine {
       this.queue.push(t);
       this.taskKeys.add(t.key);
     }
+    this.sortQueue();
   }
 
   registerPlugin(plugin) {
@@ -109,6 +118,31 @@ class UltraBackendEngine {
   generateTaskId() {
     this.taskIdCounter += 1;
     return `t_${this.nodeId}_${this.taskIdCounter}`;
+  }
+
+  sortQueue() {
+    this.queue.sort((a, b) => a.priority - b.priority);
+  }
+
+  checkMemoryProtection() {
+    const mem = process.memoryUsage();
+    const heapLimit = v8.getHeapStatistics().heap_size_limit;
+    const usageRatio = mem.heapUsed / heapLimit;
+
+    if (usageRatio > this.memoryLimit) {
+      this.emit("onMemoryWarning", { usageRatio, heapUsed: mem.heapUsed });
+      this.log(
+        "warn",
+        `Memory usage critical: ${(usageRatio * 100).toFixed(1)}%. Triggering defense.`,
+      );
+
+      if (global.gc) {
+        global.gc();
+        this.log("info", "Forced Garbage Collection executed.");
+      }
+      return false;
+    }
+    return true;
   }
 
   recordRate(key) {
@@ -159,11 +193,44 @@ class UltraBackendEngine {
     return true;
   }
 
+  detectDeadlock(taskId, dependencies) {
+    const visited = new Set();
+    const check = (deps) => {
+      for (const depId of deps) {
+        if (depId === taskId) return true;
+        if (visited.has(depId)) continue;
+        visited.add(depId);
+        const depTask = this.getTaskById(depId);
+        if (depTask && depTask.dependencies) {
+          if (check(depTask.dependencies)) return true;
+        }
+      }
+      return false;
+    };
+    return check(dependencies);
+  }
+
   addTask(taskFn, options = {}, callback) {
-    if (this.isCircuitOpen || this.isShuttingDown) {
+    if (this.circuitState === "OPEN") {
+      if (Date.now() - this.circuitOpenTime > this.circuitCooldown) {
+        this.circuitState = "HALF-OPEN";
+        this.log(
+          "warn",
+          "Circuit Breaker enters HALF-OPEN state. Testing system...",
+        );
+      } else {
+        if (callback)
+          callback(new Error("Circuit Breaker is OPEN. Task Rejected."), null);
+        return null;
+      }
+    }
+
+    if (this.isShuttingDown || !this.checkMemoryProtection()) {
       if (callback)
         callback(
-          new Error("System Protection Mode Active: Task Rejected."),
+          new Error(
+            "System Protection Mode Active or Shutting down. Task Rejected.",
+          ),
           null,
         );
       return null;
@@ -176,6 +243,15 @@ class UltraBackendEngine {
 
     if (options.key && this.taskKeys.has(options.key)) {
       this.log("warn", `Task blocked. Duplicate key found: ${options.key}`);
+      return null;
+    }
+
+    if (
+      options.dependencies &&
+      this.detectDeadlock(options.id, options.dependencies)
+    ) {
+      if (callback)
+        callback(new Error("Deadlock detected in dependencies."), null);
       return null;
     }
 
@@ -206,6 +282,8 @@ class UltraBackendEngine {
       timeout: options.timeout || this.defaultTimeout,
       retriesLeft:
         options.retries !== undefined ? options.retries : this.maxRetries,
+      maxRetries:
+        options.retries !== undefined ? options.retries : this.maxRetries,
       expiresAt: Date.now() + (options.ttl || 30000),
       createdAt: Date.now(),
       tags: options.tags || [],
@@ -215,18 +293,10 @@ class UltraBackendEngine {
       controller,
     };
 
-    let inserted = false;
-    for (let i = 0; i < this.queue.length; i++) {
-      if (newTask.priority < this.queue[i].priority) {
-        this.queue.splice(i, 0, newTask);
-        inserted = true;
-        break;
-      }
-    }
-    if (!inserted) this.queue.push(newTask);
+    this.queue.push(newTask);
+    this.sortQueue();
 
     this.recordRate(options.key || null);
-
     this.addToAuditLog(
       taskId,
       "QUEUED",
@@ -245,16 +315,13 @@ class UltraBackendEngine {
   addBulkTasks(tasks) {
     const ids = [];
     for (const t of tasks) {
-      const id = this.addTask(t.taskFn, t.options || {}, t.callback);
-      ids.push(id);
+      ids.push(this.addTask(t.taskFn, t.options || {}, t.callback));
     }
     return ids;
   }
 
   findRunnableTaskIndex() {
     const now = Date.now();
-    let bestIndex = -1;
-    let bestScore = Infinity;
     for (let i = 0; i < this.queue.length; i++) {
       const t = this.queue[i];
       if (t.dependencies && t.dependencies.length > 0) {
@@ -263,20 +330,32 @@ class UltraBackendEngine {
         );
         if (!allDone) continue;
       }
+
       const waitTime = now - t.createdAt;
-      const agingBoost = Math.floor(waitTime / 5000);
-      const effectivePriority = t.priority - agingBoost;
-      if (effectivePriority < bestScore) {
-        bestScore = effectivePriority;
-        bestIndex = i;
+      if (waitTime > 5000 && t.priority > 1) {
+        t.priority--;
+        this.addToAuditLog(
+          t.id,
+          "ESCALATED",
+          "Priority escalated via aging boost.",
+        );
       }
+      return i;
     }
-    return bestIndex;
+    return -1;
+  }
+
+  calculateDynamicConcurrency() {
+    const mem = process.memoryUsage();
+    const heapLimit = v8.getHeapStatistics().heap_size_limit;
+    const currentRamRatio = mem.heapUsed / heapLimit;
+
+    if (currentRamRatio > 0.75) return this.baseConcurrency;
+    return this.queue.length > 20 ? this.maxConcurrency : this.baseConcurrency;
   }
 
   async processNext() {
-    const currentConcurrency =
-      this.queue.length > 20 ? this.maxConcurrency : this.baseConcurrency;
+    const currentConcurrency = this.calculateDynamicConcurrency();
 
     if (
       this.isPaused ||
@@ -285,7 +364,6 @@ class UltraBackendEngine {
     ) {
       if (this.activeCount === 0 && this.queue.length === 0) {
         this.emit("onDrain");
-        if (this.isShuttingDown) this.emit("onShutdown");
       }
       return;
     }
@@ -293,48 +371,41 @@ class UltraBackendEngine {
     const index = this.findRunnableTaskIndex();
     if (index === -1) return;
 
-    this.activeCount++;
     let currentTask = this.queue.splice(index, 1)[0];
 
     if (
-      Date.now() - currentTask.createdAt > 10000 &&
-      currentTask.priority > 1
+      Date.now() - currentTask.createdAt > this.deadlineTimeout ||
+      Date.now() > currentTask.expiresAt
     ) {
-      currentTask.priority = 1;
-      this.addToAuditLog(
-        currentTask.id,
-        "ESCALATED",
-        "Priority escalated automatically.",
+      this.addToAuditLog(currentTask.id, "EXPIRED/DEADLINE");
+      this.log(
+        "warn",
+        `Task [${currentTask.id}] dropped due to expiration/deadline.`,
       );
-    }
-
-    if (Date.now() > currentTask.expiresAt) {
-      this.addToAuditLog(currentTask.id, "EXPIRED");
-      this.log("warn", `Task [${currentTask.id}] expired in queue.`);
       this.cleanupTask(currentTask);
-      this.activeCount--;
       this.processNext();
       return;
     }
 
+    this.activeCount++;
     this.emit("onTaskStart", { taskId: currentTask.id });
     this.applyPlugins("onTaskStart", { task: currentTask });
     this.addToAuditLog(currentTask.id, "STARTED");
 
-    const queueWaitTime = Date.now() - currentTask.createdAt;
-    this.metrics.totalWaitTime += queueWaitTime;
+    this.metrics.totalWaitTime += Date.now() - currentTask.createdAt;
     const executionStartTime = Date.now();
 
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => {
+    let timeoutId;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
         currentTask?.controller?.abort();
         reject(
           new Error(
             `Execution timeout after ${currentTask?.timeout || this.defaultTimeout}ms.`,
           ),
         );
-      }, currentTask.timeout),
-    );
+      }, currentTask.timeout);
+    });
 
     this.activeTasks.set(currentTask.id, currentTask);
 
@@ -343,6 +414,7 @@ class UltraBackendEngine {
         "process",
         `Executing [${currentTask.id}] (Concurrency: ${this.activeCount}/${currentConcurrency})...`,
       );
+
       const result = await Promise.race([
         currentTask.taskFn(currentTask.controller.signal),
         timeoutPromise,
@@ -353,13 +425,17 @@ class UltraBackendEngine {
       this.consecutiveFailures = 0;
       this.completedTasks.add(currentTask.id);
 
+      if (this.circuitState === "HALF-OPEN") {
+        this.circuitState = "CLOSED";
+        this.log("success", "System proved stable. Circuit Breaker CLOSED.");
+      }
+
       this.addToAuditLog(currentTask.id, "SUCCESS");
       this.log(
         "success",
         `Task [${currentTask.id}] completed in ${Date.now() - executionStartTime}ms.`,
       );
       this.emit("onTaskSuccess", { taskId: currentTask.id, result });
-      this.applyPlugins("onTaskSuccess", { task: currentTask, result });
 
       if (currentTask.workflow && currentTask.step) {
         this.advanceWorkflow(currentTask.workflow, currentTask.step, result);
@@ -371,18 +447,17 @@ class UltraBackendEngine {
       this.consecutiveFailures++;
       this.log("error", `Task [${currentTask.id}] failed: ${error.message}`);
 
-      this.applyPlugins("onTaskError", { task: currentTask, error });
-
-      if (this.consecutiveFailures >= this.circuitThreshold) {
-        this.isCircuitOpen = true;
+      if (
+        this.consecutiveFailures >= this.circuitThreshold &&
+        this.circuitState !== "OPEN"
+      ) {
+        this.circuitState = "OPEN";
+        this.circuitOpenTime = Date.now();
+        this.metrics.circuitBreakerTrips++;
         this.log(
           "error",
-          "CRITICAL: Circuit Breaker Tripped! Entering cooldown mode...",
+          "CRITICAL: Circuit Breaker Tripped OPEN! Entering cooldown mode...",
         );
-        setTimeout(() => {
-          this.isCircuitOpen = false;
-          this.consecutiveFailures = 0;
-        }, 30000);
       }
 
       if (
@@ -390,21 +465,23 @@ class UltraBackendEngine {
         !currentTask.controller.signal.aborted
       ) {
         currentTask.retriesLeft--;
+        const attempt = currentTask.maxRetries - currentTask.retriesLeft;
+        const backoffDelay = Math.pow(2, attempt) * 1000;
+
         this.addToAuditLog(
           currentTask.id,
-          "RETRYING",
-          `Retries left: ${currentTask.retriesLeft}`,
+          "RETRY_SCHEDULED",
+          `Backoff: ${backoffDelay}ms left: ${currentTask.retriesLeft}`,
         );
 
-        let inserted = false;
-        for (let i = 0; i < this.queue.length; i++) {
-          if (currentTask.priority < this.queue[i].priority) {
-            this.queue.splice(i, 0, currentTask);
-            inserted = true;
-            break;
+        setTimeout(() => {
+          if (!this.isShuttingDown) {
+            this.queue.push(currentTask);
+            this.sortQueue();
+            this.processNext();
           }
-        }
-        if (!inserted) this.queue.push(currentTask);
+        }, backoffDelay);
+
         currentTask = null;
       } else {
         this.addToAuditLog(currentTask.id, "FAILED", error.message);
@@ -415,8 +492,11 @@ class UltraBackendEngine {
         if (currentTask.callback) currentTask.callback(error, null);
       }
     } finally {
-      if (currentTask) this.cleanupTask(currentTask);
-      this.activeTasks.delete(currentTask?.id);
+      clearTimeout(timeoutId);
+      if (currentTask) {
+        this.cleanupTask(currentTask);
+        this.activeTasks.delete(currentTask.id);
+      }
       this.metrics.totalProcessed++;
       this.activeCount--;
       this.processNext();
@@ -449,6 +529,17 @@ class UltraBackendEngine {
     task.callback = null;
   }
 
+  serializeState() {
+    return JSON.stringify({
+      nodeId: this.nodeId,
+      queueLength: this.queue.length,
+      circuitState: this.circuitState,
+      completedTasksCount: this.completedTasks.size,
+      metrics: this.metrics,
+      snapshot: this.getQueueSnapshot(),
+    });
+  }
+
   getMetrics() {
     const avgSuccessTime = this.metrics.successful
       ? (this.metrics.totalExecTime / this.metrics.successful).toFixed(1)
@@ -462,6 +553,7 @@ class UltraBackendEngine {
       averageQueueWaitTimeMs: `${avgQueueTime}ms`,
       currentQueueLength: this.queue.length,
       activeConcurrency: this.activeCount,
+      circuitState: this.circuitState,
       heapUsedMegabytes: (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(
         2,
       ),
@@ -476,6 +568,7 @@ class UltraBackendEngine {
       failed: 0,
       totalWaitTime: 0,
       totalExecTime: 0,
+      circuitBreakerTrips: 0,
     };
   }
 
@@ -495,9 +588,11 @@ class UltraBackendEngine {
   }
 
   getTaskById(taskId) {
-    const inQueue = this.queue.find((t) => t.id === taskId) || null;
-    if (inQueue) return inQueue;
-    return this.activeTasks.get(taskId) || null;
+    return (
+      this.queue.find((t) => t.id === taskId) ||
+      this.activeTasks.get(taskId) ||
+      null
+    );
   }
 
   cancelTaskById(taskId) {
@@ -507,96 +602,78 @@ class UltraBackendEngine {
       task.controller.abort();
       this.cleanupTask(task);
       this.queue.splice(index, 1);
-      this.addToAuditLog(taskId, "CANCELLED", "Cancelled by ID in queue.");
+      this.addToAuditLog(taskId, "CANCELLED");
       return true;
     }
     const active = this.activeTasks.get(taskId);
     if (active) {
       active.controller.abort();
-      this.addToAuditLog(taskId, "CANCELLED", "Cancelled active task by ID.");
+      this.addToAuditLog(taskId, "CANCELLED");
       return true;
     }
     return false;
-  }
-
-  cancelTaskByKey(key) {
-    let cancelled = false;
-    this.queue = this.queue.filter((t) => {
-      if (t.key === key) {
-        t.controller.abort();
-        this.cleanupTask(t);
-        this.addToAuditLog(t.id, "CANCELLED", "Cancelled by key.");
-        cancelled = true;
-        return false;
-      }
-      return true;
-    });
-    for (const [id, task] of this.activeTasks.entries()) {
-      if (task.key === key) {
-        task.controller.abort();
-        this.addToAuditLog(id, "CANCELLED", "Cancelled active task by key.");
-        cancelled = true;
-      }
-    }
-    return cancelled;
   }
 
   flushQueue() {
     for (const task of this.queue) {
       task.controller.abort();
       this.cleanupTask(task);
-      this.addToAuditLog(task.id, "FLUSHED", "Queue flushed.");
     }
     this.queue = [];
-  }
-
-  setConcurrency(base, max) {
-    if (typeof base === "number" && base > 0) this.baseConcurrency = base;
-    if (typeof max === "number" && max >= base) this.maxConcurrency = max;
-  }
-
-  setMaxQueueLimit(limit) {
-    if (typeof limit === "number" && limit > 0) this.maxQueueLimit = limit;
+    this.taskKeys.clear();
   }
 
   pause() {
     this.isPaused = true;
     this.log("warn", "Execution Engine Paused.");
   }
-
   resume() {
     this.isPaused = false;
     this.log("success", "Execution Engine Resumed.");
     this.processNext();
   }
 
-  shutdown() {
+  async shutdown(timeoutMs = 15000) {
     this.isShuttingDown = true;
-    this.log("warn", "Shutdown initiated. No new tasks will be accepted.");
-  }
+    this.log(
+      "warn",
+      `Shutdown initiated. Waiting up to ${timeoutMs}ms for ${this.activeCount} active tasks...`,
+    );
 
-  setLoggingEnabled(enabled) {
-    this.enableLogging = !!enabled;
-  }
-
-  getDashboardData() {
-    return {
-      metrics: this.getMetrics(),
-      queue: this.getQueueSnapshot(),
-      auditLogs: this.getAuditLogs(),
-      activeTasks: Array.from(this.activeTasks.keys()),
-      nodeId: this.nodeId,
+    const checkDrain = (resolve) => {
+      if (this.activeCount === 0) resolve(true);
+      else setTimeout(() => checkDrain(resolve), 200);
     };
-  }
 
-  getTraces() {
-    return this.traces.slice();
+    const drainPromise = new Promise((resolve) => checkDrain(resolve));
+    const timeoutPromise = new Promise((resolve) =>
+      setTimeout(() => resolve(false), timeoutMs),
+    );
+
+    const cleanDone = await Promise.race([drainPromise, timeoutPromise]);
+
+    if (!cleanDone) {
+      this.log(
+        "error",
+        "Forced shutdown active due to timeout. Aborting remaining tasks.",
+      );
+      for (const [id, task] of this.activeTasks.entries()) {
+        task.controller.abort();
+      }
+    } else {
+      this.log(
+        "success",
+        "All tasks drained successfully. Safe shutdown complete.",
+      );
+    }
+
+    this.flushQueue();
+    this.listeners.onShutdown.forEach((cb) => cb());
   }
 
   on(event, callback) {
     if (this.listeners[event]) this.listeners[event].push(callback);
   }
-
   emit(event, data) {
     if (this.listeners[event]) this.listeners[event].forEach((cb) => cb(data));
   }

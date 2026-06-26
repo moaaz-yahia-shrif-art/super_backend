@@ -27,8 +27,9 @@ const mockDatabase = {
 const actionsRegistry = {
   getData: async (data) => {
     const { resource, id } = data;
-    if (!mockDatabase[resource])
+    if (!mockDatabase[resource]) {
       throw new Error(`Resource [${resource}] not found`);
+    }
 
     if (id) {
       const item = mockDatabase[resource].find((u) => u.id === parseInt(id));
@@ -40,10 +41,12 @@ const actionsRegistry = {
 
   postData: async (data) => {
     const { resource, payload } = data;
-    if (!mockDatabase[resource])
+    if (!mockDatabase[resource]) {
       throw new Error(`Resource [${resource}] not found`);
-    if (!payload || !payload.name)
+    }
+    if (!payload || !payload.name) {
       throw new Error("Invalid payload: name is required");
+    }
 
     const newItem = {
       id: mockDatabase[resource].length + 1,
@@ -55,14 +58,16 @@ const actionsRegistry = {
 
   deleteData: async (data) => {
     const { resource, id } = data;
-    if (!mockDatabase[resource])
+    if (!mockDatabase[resource]) {
       throw new Error(`Resource [${resource}] not found`);
+    }
 
     const index = mockDatabase[resource].findIndex(
       (u) => u.id === parseInt(id),
     );
-    if (index === -1)
+    if (index === -1) {
       throw new Error(`Item with ID [${id}] not found to delete`);
+    }
 
     const deletedItem = mockDatabase[resource].splice(index, 1)[0];
     return { message: "Item deleted successfully", deletedItem };
@@ -79,18 +84,31 @@ app.post("/api/execute", (req, res) => {
     });
   }
 
-  engine.addTask(
-    () => targetFunction(data),
+  const taskId = engine.addTask(
+    (signal) => targetFunction(data),
     { priority: priority || "normal", key, timeout },
     (err, result) => {
+      if (res.headersSent) return;
       if (err) return res.status(500).json({ error: err.message });
-      res.json({ status: "success", action, result });
+      return res.json({ status: "success", action, result });
     },
   );
+
+  if (!taskId && !res.headersSent) {
+    return res.status(429).json({
+      error:
+        "Task rejected by Engine (Rate limit, Circuit Breaker, or Memory Protection active).",
+    });
+  }
 });
 
 app.get("/api/engine/dashboard", (req, res) => {
-  res.json(engine.getDashboardData());
+  res.json({
+    metrics: engine.getMetrics(),
+    queue: engine.getQueueSnapshot(),
+    auditLogs: engine.getAuditLogs(),
+    nodeId: engine.nodeId,
+  });
 });
 
 const server = app.listen(PORT);
