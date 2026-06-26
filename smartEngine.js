@@ -327,8 +327,12 @@ class UltraBackendEngine {
 
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => {
-        currentTask.controller.abort();
-        reject(new Error(`Execution timeout after ${currentTask.timeout}ms.`));
+        currentTask?.controller?.abort();
+        reject(
+          new Error(
+            `Execution timeout after ${currentTask?.timeout || this.defaultTimeout}ms.`,
+          ),
+        );
       }, currentTask.timeout),
     );
 
