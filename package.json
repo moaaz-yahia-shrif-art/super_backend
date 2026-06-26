@@ -1,0 +1,12 @@
+{
+  "name": "ultra-backend-engine-server",
+  "version": "1.0.0",
+  "description": "Universal Gateway Engine backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
