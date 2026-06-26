@@ -1,7 +1,10 @@
 const express = require("express");
+const cors = require("cors");
 const UltraBackendEngine = require("./smartEngine");
 
 const app = express();
+
+app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
@@ -71,11 +74,9 @@ app.post("/api/execute", (req, res) => {
 
   const targetFunction = actionsRegistry[action];
   if (!targetFunction) {
-    return res
-      .status(400)
-      .json({
-        error: `The action [${action}] is not registered in the system.`,
-      });
+    return res.status(400).json({
+      error: `The action [${action}] is not registered in the system.`,
+    });
   }
 
   engine.addTask(
@@ -92,6 +93,24 @@ app.get("/api/engine/dashboard", (req, res) => {
   res.json(engine.getDashboardData());
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Universal Gateway API is live on port ${PORT}`);
-});
+const server = app.listen(PORT);
+
+server
+  .on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.log(
+        `Port ${PORT} is already in use. Retrying with a different port...`,
+      );
+      setTimeout(() => {
+        server.close();
+        server.listen(0);
+      }, 1000);
+    } else {
+      console.error("Server error:", err);
+    }
+  })
+  .on("listening", () => {
+    const address = server.address();
+    const bind = typeof address === "string" ? address : address.port;
+    console.log("🚀 Universal Gateway API is live on port ", bind);
+  });
