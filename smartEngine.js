@@ -160,12 +160,7 @@ class UltraBackendEngine {
   }
 
   addTask(taskFn, options = {}, callback) {
-    if (
-      this.isCircuitOpen ||
-      this.isShuttingDown ||
-      process.memoryUsage().heapUsed / process.memoryUsage().heapTotal >
-        this.memoryLimit
-    ) {
+    if (this.isCircuitOpen || this.isShuttingDown) {
       if (callback)
         callback(
           new Error("System Protection Mode Active: Task Rejected."),
