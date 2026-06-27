@@ -1,11 +1,11 @@
 const v8 = require("v8");
 const EventEmitter = require("events");
-const Logger = require("./core/logger");
-const RateLimiter = require("./core/rateLimiter");
-const CircuitBreaker = require("./core/circuitBreaker");
-const Metrics = require("./core/metrics");
-const WorkflowEngine = require("./core/workflowEngine");
-const TaskQueue = require("./core/taskQueue");
+const Logger = require("../core/logger");
+const RateLimiter = require("../core/rateLimiter");
+const CircuitBreaker = require("../core/circuitBreaker");
+const Metrics = require("../core/metrics");
+const WorkflowEngine = require("../core/workflowEngine");
+const TaskQueue = require("../core/taskQueue");
 
 class UltraBackendEngine extends EventEmitter {
   constructor(options = {}) {
