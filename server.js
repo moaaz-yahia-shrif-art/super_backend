@@ -1,6 +1,6 @@
 const express = require("express");
 const cors = require("cors");
-const UltraBackendEngine = require("./smartEngine");
+const UltraBackendEngine = require("./ultraBackendEngine");
 
 const app = express();
 
@@ -109,6 +109,10 @@ app.get("/api/engine/dashboard", (req, res) => {
     auditLogs: engine.getAuditLogs(),
     nodeId: engine.nodeId,
   });
+});
+
+app.use((req, res) => {
+  res.status(404).json({ error: "Route not found" });
 });
 
 const server = app.listen(PORT);
